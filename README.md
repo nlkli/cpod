@@ -1,8 +1,9 @@
 # cpod
 
-minimal c player
+minimal c audio player
 
 ## TODO List
 
 - [x] ffmpeg decoder (PCM)
-- [ ] Core Audio
+- [ ] frame resampling
+- [ ] Core Audio (play)

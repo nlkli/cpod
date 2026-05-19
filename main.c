@@ -1,208 +1,597 @@
+#include <dirent.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#include <sys/stat.h>
+#include <termios.h>
+#include <time.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libavutil/samplefmt.h>
+#include <libavutil/log.h>
+#include <libswresample/swresample.h>
 
 #include <AudioToolbox/AudioToolbox.h>
 
-#define SR 44100
-#define BUF 1024
+#define DEFAULT_SAMPLE_RATE 48000
+#define DEFAULT_FRAMES_PER_BUF 4096
+
+#define BUFFER_COUNT 3
+#define VOLUME_STEP 0.05
 
 typedef struct {
+    char **paths;
+    int len;
+    int cap;
+    int prevpi;
+} PlayList;
 
-  char *next_audio_path;
-
-  AVFormatContext *fmt_ctx;
-  const AVCodec *codec;
-  int audio_stream_idx;
-  AVCodecContext *codec_ctx;
-  AVPacket *packet;
-  AVFrame *frame;
-
-} PlayerState;
-
-int next_audio(char *path, PlayerState *ps) {
-  ps->next_audio_path = path;
-
-  if (ps->fmt_ctx != NULL)
-    avformat_close_input(&ps->fmt_ctx);
-
-  int ret;
-
-  ret = avformat_open_input(&ps->fmt_ctx, path, NULL, NULL);
-  if (ret < 0)
-    return ret;
-
-  ret = avformat_find_stream_info(ps->fmt_ctx, NULL);
-  if (ret < 0)
-    return ret;
-
-  ret = av_find_best_stream(ps->fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &ps->codec,
-                            0);
-  if (ret < 0)
-    return ret;
-
-  ps->audio_stream_idx = ret;
-
-  if (ps->codec_ctx != NULL)
-    avcodec_free_context(&ps->codec_ctx);
-
-  ps->codec_ctx = avcodec_alloc_context3(ps->codec);
-  if (!ps->codec_ctx)
-    return -1;
-
-  avcodec_parameters_to_context(
-      ps->codec_ctx, ps->fmt_ctx->streams[ps->audio_stream_idx]->codecpar);
-
-  ret = avcodec_open2(ps->codec_ctx, ps->codec, NULL);
-  if (ret < 0)
-    return ret;
-
-  if (ps->packet != NULL)
-    av_packet_free(&ps->packet);
-  if (ps->frame != NULL)
-    av_frame_free(&ps->frame);
-
-  ps->packet = av_packet_alloc();
-  ps->frame = av_frame_alloc();
-
-  return 0;
+void pl_init_with_cap(PlayList *pl, int cap) {
+    cap = (!cap) ? 1 : cap;
+    pl->paths = malloc(cap * sizeof(char *));
+    pl->len = 0;
+    pl->cap = cap;
+    pl->prevpi = -1;
 }
 
-int next_frame(PlayerState *ps) {
+void pl_push(PlayList *pl, const char *name) {
+    if (pl->len >= pl->cap) {
+        pl->cap *= 2;
+        pl->paths = realloc(pl->paths, pl->cap * sizeof(char *));
+    }
 
-  if (avcodec_receive_frame(ps->codec_ctx, ps->frame) == 0) {
+    pl->paths[pl->len] = malloc(strlen(name) + 1);
+    if (pl->paths[pl->len]) {
+        strcpy(pl->paths[pl->len], name);
+        pl->len++;
+    }
+}
 
-    enum AVSampleFormat fmt = ps->frame->format;
+int pl_from_dir(PlayList *pl, const char *path) {
+    DIR *dir = opendir(path);
 
-    const char *fmt_name = av_get_sample_fmt_name(fmt);
+    if (!dir)
+        return -1;
 
-    int planar = av_sample_fmt_is_planar(fmt);
+    struct dirent *entry;
+    struct stat file_stat;
 
-    int channels = ps->frame->ch_layout.nb_channels;
+    while ((entry = readdir(dir)) != NULL) {
+        char file_path[1024];
+        snprintf(file_path, sizeof(file_path), "%s/%s", path, entry->d_name);
+        if (stat(file_path, &file_stat) != 0)
+            continue;
+        // ignore dot files
+        if (entry->d_name[0] == '.')
+            continue;
+        if (S_ISREG(file_stat.st_mode)) {
+            pl_push(pl, file_path);
+        }
+    }
 
-    int bytes_per_sample = av_get_bytes_per_sample(fmt);
+    closedir(dir);
 
-    int total_bytes = ps->frame->nb_samples * channels * bytes_per_sample;
+    return 0;
+}
 
-    char layout[128];
-    av_channel_layout_describe(&ps->frame->ch_layout, layout, sizeof(layout));
+char *pl_pick(PlayList *pl, int i) {
+    if (i >= pl->len || i < 0)
+        return NULL;
+    pl->prevpi = i;
+    return pl->paths[i];
+}
 
-    printf("sample_rate      : %d Hz\n", ps->frame->sample_rate);
-    printf("channels         : %d\n", channels);
-    printf("channel_layout   : %s\n", layout);
-    printf("samples          : %d\n", ps->frame->nb_samples);
-    printf("sample_format    : %s\n", fmt_name ? fmt_name : "unknown");
-    printf("planar           : %s\n", planar ? "yes" : "no");
-    printf("bytes/sample     : %d\n", bytes_per_sample);
-    printf("frame_size       : %d bytes\n", total_bytes);
-    printf("pts              : %lld\n", ps->frame->pts);
-    printf("duration         : %lld\n", ps->frame->duration);
+char *pl_rand_pick(PlayList *pl) {
+    if (pl->len == 0)
+        return NULL;
+    return pl_pick(pl, rand() % pl->len);
+}
 
-    printf("\n");
+char *pl_next_pick(PlayList *pl) {
+    int pi = 0;
+    if (pl->prevpi + 1 < pl->len)
+        pi = pl->prevpi + 1;
+    return pl_pick(pl, pi);
+}
 
-    av_frame_unref(ps->frame);
+char *pl_priv_pick(PlayList *pl) {
+    int pi = pl->len - 1;
+    if (pl->prevpi - 1 > 0)
+        pi = pl->prevpi - 1;
+    return pl_pick(pl, pi);
+}
+
+void pl_free(PlayList *pl) {
+    for (int i = 0; i < pl->len; i++) {
+        free(pl->paths[i]);
+    }
+
+    free(pl->paths);
+
+    pl->paths = NULL;
+    pl->len = 0;
+    pl->cap = 0;
+    pl->prevpi = 0;
+}
+
+typedef struct {
+    int frames_per_buf;
+    AudioQueueRef queue;
+    AVFormatContext *fmt_ctx;
+    const AVCodec *codec;
+    int audio_stream_idx;
+    AVCodecContext *codec_ctx;
+    SwrContext *swr;
+    AVPacket *packet;
+    AVFrame *frame;
+    int is_auto_play;
+    int is_pause;
+    float volume; // 0.0 - 1.0
+    int64_t last_pts;
+    int done;
+} PlayerState;
+
+int next_frame(PlayerState *ps, float *buf, int cap) {
+    if (ps->done)
+        return 0;
+    for (;;) {
+        int ret = avcodec_receive_frame(ps->codec_ctx, ps->frame);
+
+        if (ret == 0) {
+            uint8_t *out_planes[1] = {(uint8_t *)buf};
+            int out_samples = swr_convert(
+                ps->swr,
+                out_planes, cap,
+                (const uint8_t **)ps->frame->extended_data, ps->frame->nb_samples);
+            if (ps->volume < 1.) {
+                for (int i = 0; i < out_samples * 2; i++) {
+                    buf[i] *= ps->volume;
+                }
+            }
+            ps->last_pts = ps->frame->pts;
+            av_frame_unref(ps->frame);
+            return out_samples;
+        }
+
+        if (ret != AVERROR(EAGAIN)) {
+            ps->done = 1;
+            return 0;
+        }
+
+        do {
+            ret = av_read_frame(ps->fmt_ctx, ps->packet);
+            if (ret < 0) {
+                avcodec_send_packet(ps->codec_ctx, NULL);
+                int out_samples;
+                while (avcodec_receive_frame(ps->codec_ctx, ps->frame) == 0) {
+                    uint8_t *out_planes[1] = {(uint8_t *)buf};
+                    out_samples = swr_convert(
+                        ps->swr,
+                        out_planes, cap,
+                        (const uint8_t **)ps->frame->extended_data, ps->frame->nb_samples);
+                    if (ps->volume < 1.) {
+                        for (int i = 0; i < out_samples * 2; i++) {
+                            buf[i] *= ps->volume;
+                        }
+                    }
+                    av_frame_unref(ps->frame);
+                }
+                uint8_t *out_planes[1] = {(uint8_t *)buf};
+                swr_convert(ps->swr, out_planes, cap, NULL, 0);
+                ps->done = 1;
+                return out_samples;
+            }
+        } while (ps->packet->stream_index != ps->audio_stream_idx);
+
+        avcodec_send_packet(ps->codec_ctx, ps->packet);
+        av_packet_unref(ps->packet);
+    }
+}
+
+int next_samples_fill(PlayerState *ps, float *buf, int want_frames) {
+    int filled = 0;
+
+    while (filled < want_frames) {
+        int remaining = want_frames - filled;
+        float *dst = buf + filled * 2;
+
+        int got = next_frame(ps, dst, remaining);
+        if (got <= 0)
+            break;
+
+        filled += got;
+    }
+
+    return filled;
+}
+
+static void queue_callback(void *state, AudioQueueRef queue, AudioQueueBufferRef buf) {
+    PlayerState *ps = (PlayerState *)state;
+
+    float *dst = (float *)buf->mAudioData;
+    int samples = next_samples_fill(ps, dst, ps->frames_per_buf);
+
+    if (samples <= 0) {
+        AudioQueueStop(queue, false);
+        buf->mAudioDataByteSize = 0;
+        AudioQueueEnqueueBuffer(queue, buf, 0, NULL);
+        return;
+    }
+
+    buf->mAudioDataByteSize = samples * 2 * sizeof(float);
+    AudioQueueEnqueueBuffer(queue, buf, 0, NULL);
+}
+
+int ps_init(PlayerState *ps, float sample_rate, int frames_per_buf, float init_volume) {
+    AudioStreamBasicDescription fmt = {
+        .mSampleRate = sample_rate,
+        .mFormatID = kAudioFormatLinearPCM,
+        .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+        .mChannelsPerFrame = 2,
+        .mBitsPerChannel = 32,
+        .mBytesPerFrame = 2 * sizeof(float),
+        .mFramesPerPacket = 1,
+        .mBytesPerPacket = 2 * sizeof(float),
+    };
+
+    int ret = AudioQueueNewOutput(&fmt, queue_callback, ps, NULL, NULL, 0, &ps->queue);
+    if (ret < 0)
+        return ret;
+
+    ps->frames_per_buf = frames_per_buf;
+    ps->last_pts = AV_NOPTS_VALUE;
+    ps->volume = init_volume;
+    if (ps->volume > 1.)
+        ps->volume = 1.;
+    if (ps->volume < 0.)
+        ps->volume = 0.;
+    ps->done = 1;
 
     return 1;
-  }
+}
 
-  av_packet_unref(ps->packet);
+int ps_load(PlayerState *ps, const char *path) {
+    if (ps->fmt_ctx)
+        avformat_close_input(&ps->fmt_ctx);
 
-  do {
-    if (av_read_frame(ps->fmt_ctx, ps->packet) < 0) {
-      av_frame_free(&ps->frame);
-      av_packet_free(&ps->packet);
-      return 0;
+    int ret;
+
+    ret = avformat_open_input(&ps->fmt_ctx, path, NULL, NULL);
+    if (ret < 0)
+        return ret;
+
+    ret = avformat_find_stream_info(ps->fmt_ctx, NULL);
+    if (ret < 0)
+        return ret;
+
+    ret = av_find_best_stream(ps->fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &ps->codec, 0);
+    if (ret < 0)
+        return ret;
+    ps->audio_stream_idx = ret;
+
+    if (ps->codec_ctx)
+        avcodec_free_context(&ps->codec_ctx);
+
+    ps->codec_ctx = avcodec_alloc_context3(ps->codec);
+    if (!ps->codec_ctx)
+        return -1;
+
+    avcodec_parameters_to_context(
+        ps->codec_ctx,
+        ps->fmt_ctx->streams[ps->audio_stream_idx]->codecpar);
+
+    ret = avcodec_open2(ps->codec_ctx, ps->codec, NULL);
+    if (ret < 0)
+        return ret;
+    avcodec_flush_buffers(ps->codec_ctx);
+
+    if (ps->swr)
+        swr_free(&ps->swr);
+
+    AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+    ret = swr_alloc_set_opts2(&ps->swr,
+                              &out_ch_layout, AV_SAMPLE_FMT_FLT, 48000,
+                              &ps->codec_ctx->ch_layout, ps->codec_ctx->sample_fmt,
+                              ps->codec_ctx->sample_rate,
+                              0, NULL);
+    if (ret < 0)
+        return ret;
+
+    ret = swr_init(ps->swr);
+    if (ret < 0)
+        return ret;
+
+    if (ps->packet)
+        av_packet_free(&ps->packet);
+    if (ps->frame)
+        av_frame_free(&ps->frame);
+
+    ps->packet = av_packet_alloc();
+    ps->frame = av_frame_alloc();
+
+    ps->last_pts = AV_NOPTS_VALUE;
+    ps->done = 0;
+
+    return 0;
+}
+
+void ps_play(PlayerState *ps) {
+    if (!ps->is_pause || ps->done)
+        return;
+    uint32_t buf_bytes = ps->frames_per_buf * 2 * sizeof(float);
+    for (int i = 0; i < BUFFER_COUNT; i++) {
+        AudioQueueBufferRef buf;
+        AudioQueueAllocateBuffer(ps->queue, buf_bytes, &buf);
+        queue_callback(ps, ps->queue, buf);
     }
-  } while (ps->packet->stream_index != ps->audio_stream_idx);
 
-  avcodec_send_packet(ps->codec_ctx, ps->packet);
+    AudioQueueStart(ps->queue, NULL);
+    ps->is_pause = 0;
+}
 
-  return next_frame(ps);
+void ps_pause(PlayerState *ps) {
+    if (ps->is_pause)
+        return;
+    AudioQueueStop(ps->queue, true);
+    ps->is_pause = 1;
+}
+
+float ps_progress(PlayerState *ps) {
+    if (ps->fmt_ctx->duration <= 0)
+        return 0.0;
+
+    int64_t pts = ps->last_pts;
+    if (pts == AV_NOPTS_VALUE)
+        return 0.0;
+
+    AVStream *stream = ps->fmt_ctx->streams[ps->audio_stream_idx];
+    float current = pts * av_q2d(stream->time_base);
+    float total = ps->fmt_ctx->duration / (float)AV_TIME_BASE;
+
+    return current / total;
+}
+
+void ps_free(PlayerState *ps) {
+    AudioQueueStop(ps->queue, true);
+    AudioQueueDispose(ps->queue, true);
+
+    avcodec_free_context(&ps->codec_ctx);
+    avformat_close_input(&ps->fmt_ctx);
+    swr_free(&ps->swr);
+    av_packet_free(&ps->packet);
+    av_frame_free(&ps->frame);
+}
+
+typedef enum {
+    PE_NONE = 0,
+    PE_PLAY,
+    PE_PAUSE,
+    PE_VOLUP,
+    PE_VOLDOWN,
+    PE_RAND,
+    PE_NEXT,
+    PE_PREV,
+} PlayerEvent;
+
+int ps_handle_event(PlayerState *ps, PlayerEvent e, PlayList *pl) {
+    int ret = 1;
+    if (e == PE_NONE)
+        return ret;
+    switch (e) {
+    case PE_PLAY:
+        ps_play(ps);
+        break;
+    case PE_PAUSE:
+        ps_pause(ps);
+        break;
+    case PE_VOLUP:
+        ps->volume += VOLUME_STEP;
+        if (ps->volume > 1.)
+            ps->volume = 1.;
+        break;
+    case PE_VOLDOWN:
+        ps->volume -= VOLUME_STEP;
+        if (ps->volume < 0.)
+            ps->volume = 0.;
+        break;
+    case PE_RAND:
+        ps_pause(ps);
+        ret = ps_load(ps, pl_rand_pick(pl));
+        ps_play(ps);
+        break;
+    case PE_NEXT:
+        ps_pause(ps);
+        ret = ps_load(ps, pl_next_pick(pl));
+        ps_play(ps);
+        break;
+    case PE_PREV:
+        ps_pause(ps);
+        ret = ps_load(ps, pl_priv_pick(pl));
+        ps_play(ps);
+        break;
+    default:
+        break;
+    }
+    return ret;
+}
+
+static struct termios orig_termios;
+static int terminal_initialized = 0;
+
+void enter_raw_mode() {
+    struct termios raw;
+
+    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) {
+        perror("tcgetattr");
+        exit(1);
+    }
+    terminal_initialized = 1;
+    raw = orig_termios;
+
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    // raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
+        perror("tcsetattr");
+        exit(1);
+    }
+}
+
+void exit_raw_mode() {
+    if (terminal_initialized) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        terminal_initialized = 0;
+    }
+}
+
+typedef enum {
+    KEY_NONE = 0,
+    KEY_CHAR,
+    KEY_CTRL,
+    KEY_ESCAPE,
+    KEY_ENTER,
+    KEY_BACKSPACE,
+    KEY_UP,
+    KEY_DOWN,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_UNKNOWN,
+} KeyType;
+
+typedef struct {
+    KeyType type;
+    char ch; // KEY_CHAR or KEY_CTRL
+} KeyEvent;
+
+int read_key(KeyEvent *ev) {
+    char buf[8];
+    int n;
+
+    memset(ev, 0, sizeof(*ev));
+
+    n = read(STDIN_FILENO, buf, 1);
+    if (n <= 0) {
+        ev->type = KEY_NONE;
+        return n;
+    }
+
+    if (buf[0] == 0x1B) {
+        int m = read(STDIN_FILENO, buf + 1, sizeof(buf) - 1);
+        if (m <= 0) {
+            ev->type = KEY_ESCAPE;
+            return 1;
+        }
+
+        if (buf[1] == '[') {
+            if (buf[2] == 'A')
+                ev->type = KEY_UP;
+            else if (buf[2] == 'B')
+                ev->type = KEY_DOWN;
+            else if (buf[2] == 'C')
+                ev->type = KEY_RIGHT;
+            else if (buf[2] == 'D')
+                ev->type = KEY_LEFT;
+            else
+                ev->type = KEY_UNKNOWN;
+
+        } else {
+            ev->type = KEY_UNKNOWN;
+        }
+        return 1;
+    }
+
+    if (buf[0] == '\r' || buf[0] == '\n') {
+        ev->type = KEY_ENTER;
+        return 1;
+    }
+
+    if (buf[0] == 127 || buf[0] == 8) {
+        ev->type = KEY_BACKSPACE;
+        return 1;
+    }
+
+    if (buf[0] >= 1 && buf[0] <= 26) {
+        ev->type = KEY_CTRL;
+        ev->ch = 'a' + buf[0] - 1;
+        return 1;
+    }
+
+    ev->type = KEY_CHAR;
+    ev->ch = (char)buf[0];
+
+    return 1;
 }
 
 int main(void) {
-  PlayerState ps = {0};
 
-  next_audio("./resources/Hide rework - Dark Fantasy Quest [lzwc6VDSBUo].opus",
-             &ps);
+    srand(time(NULL));
 
-  while (next_frame(&ps));
+    av_log_set_level(AV_LOG_QUIET);
 
-  avcodec_free_context(&ps.codec_ctx);
-  avformat_close_input(&ps.fmt_ctx);
+    enter_raw_mode();
+    write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7);
 
-  return 0;
+    PlayList pl = {0};
+    pl_init_with_cap(&pl, 0);
+
+    pl_from_dir(&pl, "/Users/Nikita/Desktop/music.youtube");
+
+    PlayerState ps = {0};
+
+    ps_init(&ps, DEFAULT_SAMPLE_RATE, DEFAULT_FRAMES_PER_BUF, 0.9);
+
+    PlayerEvent pe = PE_NONE;
+    KeyEvent ke;
+
+    for (;;) {
+        read_key(&ke);
+
+        if (ke.type == KEY_CHAR) {
+            if (ke.ch == 'q')
+                break;
+            switch (ke.ch) {
+            case 'n':
+                pe = PE_NEXT;
+                break;
+            case 'p':
+                pe = PE_PREV;
+                break;
+            case 'r':
+                pe = PE_RAND;
+                break;
+            case '.':
+                pe = PE_PAUSE;
+                break;
+            case 's':
+                pe = PE_PLAY;
+                break;
+            case '+':
+                pe = PE_VOLUP;
+                break;
+            case '-':
+                pe = PE_VOLDOWN;
+                break;
+            }
+        }
+
+        ps_handle_event(&ps, pe, &pl);
+
+        usleep(20000);
+
+        pe = PE_NONE;
+    }
+
+    exit_raw_mode();
+
+    usleep(500000);
+
+    ps_free(&ps);
+    pl_free(&pl);
+
+    return 0;
 }
-
-// void callback(void *userData,
-//               AudioQueueRef q,
-//               AudioQueueBufferRef buf)
-// {
-//     float *out = (float *)buf->mAudioData;
-//
-//     for (int i = 0; i < BUF; i++) {
-//
-//         out[i] = sinf(phase) * 0.2f;
-//
-//         phase += 2.0f * M_PI * 440.0f / SR;
-//     }
-//
-//     buf->mAudioDataByteSize = BUF * sizeof(float);
-//
-//     AudioQueueEnqueueBuffer(q, buf, 0, NULL);
-// }
-
-// int main()
-// {
-//     AudioStreamBasicDescription asbd = {0};
-//
-//     asbd.mSampleRate = 48000;
-//
-//     // PCM
-//     asbd.mFormatID = kAudioFormatLinearPCM;
-//
-//     // float32 + packed
-//     asbd.mFormatFlags =
-//         kLinearPCMFormatFlagIsFloat |
-//         kLinearPCMFormatFlagIsPacked;
-//
-//     // float32 = 32 bits
-//     asbd.mBitsPerChannel = 32;
-//
-//     // stereo
-//     asbd.mChannelsPerFrame = 2;
-//
-//     // PCM packet = 1 frame
-//     asbd.mFramesPerPacket = 1;
-//
-//     // float32 stereo:
-//     // 4 bytes * 2 channels
-//     asbd.mBytesPerFrame = 8;
-//
-//     // PCM: packet == frame
-//     asbd.mBytesPerPacket = 8;
-//
-//     // ...
-//
-//     AudioQueueRef q;
-//
-//     AudioQueueNewOutput(&asbd, callback, NULL, NULL, NULL, 0, &q);
-//
-//     for (int i = 0; i < 3; i++) {
-//         AudioQueueBufferRef buf;
-//         AudioQueueAllocateBuffer(q, BUF * sizeof(float), &buf);
-//         callback(NULL, q, buf);
-//     }
-//
-//     AudioQueueStart(q, NULL);
-//
-//     sleep(5);
-//
-//     AudioQueueStop(q, true);
-//     AudioQueueDispose(q, true);
-// }

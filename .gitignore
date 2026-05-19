@@ -1,2 +1,4 @@
 .clangd
+./cpod
+./clang-format
 

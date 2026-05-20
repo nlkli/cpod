@@ -1,5 +1,6 @@
 #include <dirent.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,7 +27,7 @@ typedef struct {
     int prevpi;
 } PlayList;
 
-void pl_init_with_cap(PlayList *pl, int cap) {
+void pl_init(PlayList *pl, int cap) {
     cap = (!cap) ? 1 : cap;
     pl->paths = malloc(cap * sizeof(char *));
     pl->len = 0;
@@ -47,31 +48,72 @@ void pl_push(PlayList *pl, const char *name) {
     }
 }
 
+int __compare_strings(const void *a, const void *b) {
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
+void pl_sort(PlayList *pl) {
+    qsort(pl->paths, pl->len, sizeof(char *), __compare_strings);
+}
+
 int pl_from_dir(PlayList *pl, const char *path) {
     DIR *dir = opendir(path);
-
     if (!dir)
         return -1;
 
     struct dirent *entry;
-    struct stat file_stat;
+    struct stat st;
 
     while ((entry = readdir(dir)) != NULL) {
         char file_path[1024];
         snprintf(file_path, sizeof(file_path), "%s/%s", path, entry->d_name);
-        if (stat(file_path, &file_stat) != 0)
+        if (stat(file_path, &st) != 0)
             continue;
         // ignore dot files
         if (entry->d_name[0] == '.')
             continue;
-        if (S_ISREG(file_stat.st_mode)) {
+        if (S_ISREG(st.st_mode)) {
             pl_push(pl, file_path);
         }
     }
 
     closedir(dir);
 
-    return 0;
+    return 1;
+}
+
+int pl_from_file(PlayList *pl, const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return -1;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = 0;
+        pl_push(pl, line);
+    }
+
+    fclose(fp);
+
+    return 1;
+}
+
+int pl_from_any_path(PlayList *pl, const char *path) {
+    struct stat st;
+
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return pl_from_dir(pl, path);
+        } else if (S_ISREG(st.st_mode)) {
+            return pl_from_file(pl, path);
+        }
+        return -1;
+    } else {
+        perror("stat");
+        return -1;
+    }
+
+    return 1;
 }
 
 char *pl_pick(PlayList *pl, int i) {
@@ -222,7 +264,7 @@ static void queue_callback(void *state, AudioQueueRef queue, AudioQueueBufferRef
     AudioQueueEnqueueBuffer(queue, buf, 0, NULL);
 }
 
-int ps_init(PlayerState *ps, float sample_rate, int frames_per_buf, float init_volume) {
+int ps_init(PlayerState *ps, float sample_rate, int frames_per_buf, int is_auto_play, float init_volume) {
     AudioStreamBasicDescription fmt = {
         .mSampleRate = sample_rate,
         .mFormatID = kAudioFormatLinearPCM,
@@ -240,6 +282,7 @@ int ps_init(PlayerState *ps, float sample_rate, int frames_per_buf, float init_v
 
     ps->frames_per_buf = frames_per_buf;
     ps->last_pts = AV_NOPTS_VALUE;
+    ps->is_auto_play = is_auto_play;
     ps->volume = init_volume;
     if (ps->volume > 1.)
         ps->volume = 1.;
@@ -312,6 +355,55 @@ int ps_load(PlayerState *ps, const char *path) {
     ps->last_pts = AV_NOPTS_VALUE;
     ps->done = 0;
 
+    // TODO
+
+    printf("\n\n[Track] %s\n", path);
+    printf("  Format:      %s\n", ps->fmt_ctx->iformat->long_name);
+
+    if (ps->fmt_ctx->duration != AV_NOPTS_VALUE) {
+        int64_t dur_sec = ps->fmt_ctx->duration / AV_TIME_BASE;
+        printf("  Duration:    %" PRId64 ":%02" PRId64 ":%02" PRId64 "\n",
+               dur_sec / 3600, (dur_sec % 3600) / 60, dur_sec % 60);
+    }
+
+    if (ps->fmt_ctx->bit_rate > 0)
+        printf("  Bitrate:     %" PRId64 " kb/s\n", ps->fmt_ctx->bit_rate / 1000);
+
+    AVStream *audio_stream = ps->fmt_ctx->streams[ps->audio_stream_idx];
+    AVCodecParameters *par = audio_stream->codecpar;
+
+    printf("\n[Audio Stream]\n");
+    printf("  Codec:       %s\n", ps->codec->long_name);
+
+    if (par->bit_rate > 0)
+        printf("  Bitrate:     %" PRId64 " kb/s\n", par->bit_rate / 1000);
+
+    printf("  Sample rate: %d Hz\n", par->sample_rate);
+
+    char ch_buf[64];
+    av_channel_layout_describe(&par->ch_layout, ch_buf, sizeof(ch_buf));
+    printf("  Channels:    %d (%s)\n", par->ch_layout.nb_channels, ch_buf);
+    printf("  Format:      %s (%d-bit)\n",
+           av_get_sample_fmt_name(par->format),
+           av_get_bytes_per_sample(par->format) * 8);
+
+    const char *meta_keys[] = {"title", "artist", "album", "date", "track", "genre", NULL};
+    int has_meta = 0;
+    for (int i = 0; meta_keys[i]; i++) {
+        AVDictionaryEntry *tag = av_dict_get(audio_stream->metadata, meta_keys[i], NULL, 0);
+        if (!tag)
+            tag = av_dict_get(ps->fmt_ctx->metadata, meta_keys[i], NULL, 0);
+        if (tag) {
+            if (!has_meta) {
+                printf("\n[Metadata]\n");
+                has_meta = 1;
+            }
+            printf("  %-10s %s\n", tag->key, tag->value);
+        }
+    }
+
+    printf("\n");
+
     return 0;
 }
 
@@ -364,7 +456,6 @@ void ps_free(PlayerState *ps) {
 
 typedef enum {
     PE_NONE = 0,
-    PE_PLAY,
     PE_PAUSE,
     PE_VOLUP,
     PE_VOLDOWN,
@@ -378,11 +469,11 @@ int ps_handle_event(PlayerState *ps, PlayerEvent e, PlayList *pl) {
     if (e == PE_NONE)
         return ret;
     switch (e) {
-    case PE_PLAY:
-        ps_play(ps);
-        break;
     case PE_PAUSE:
-        ps_pause(ps);
+        if (ps->is_pause)
+            ps_play(ps);
+        else
+            ps_pause(ps);
         break;
     case PE_VOLUP:
         ps->volume += VOLUME_STEP;
@@ -425,6 +516,7 @@ void enter_raw_mode() {
         perror("tcgetattr");
         exit(1);
     }
+    write(STDOUT_FILENO, "\x1b[?1049h", 8);
     terminal_initialized = 1;
     raw = orig_termios;
 
@@ -445,6 +537,7 @@ void enter_raw_mode() {
 void exit_raw_mode() {
     if (terminal_initialized) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        write(STDOUT_FILENO, "\x1b[?1049l", 8);
         terminal_initialized = 0;
     }
 }
@@ -527,7 +620,82 @@ int read_key(KeyEvent *ev) {
     return 1;
 }
 
-int main(void) {
+typedef struct {
+    char *input;
+} Args;
+
+#define VERSION "cpod 0.1.0 [https://github.com/nlkli/cpod]"
+static const char *HELP_MSG_LINES[] = {
+    "",
+    "minimal c audio player",
+    "https://github.com/nlkli/cpod",
+    "Options:",
+    "  -i, --input <path>   Input playlist path (dir or file)",
+    "  -h, --help           Show this help message",
+    "  -V, --version        Show this help message",
+    "Keymaps:",
+    "  j    Next",
+    "  k    Prev",
+    "  J    Rand",
+    "  p    Pause",
+    "  +    Vol up",
+    "  -    Vol down",
+    "",
+    NULL};
+static void print_help_msg() {
+    for (int l = 0; HELP_MSG_LINES[l] != NULL; l++) {
+        printf("%s\n", HELP_MSG_LINES[l]);
+    }
+}
+
+void parse_args(Args *args, int argc, char *argv[]) {
+    uint8_t last = 0;
+    for (int i = 0; i < argc; i++) {
+        char *arg = argv[i];
+        int n = strlen(arg);
+        if (n > 2 && strncmp(arg, "--", 2) == 0) {
+            if (strcmp(arg + 2, "input") == 0) {
+                last = 'i';
+            }
+            if (strcmp(arg + 2, "help") == 0) {
+                print_help_msg();
+                exit(0);
+            }
+            if (strcmp(arg + 2, "version") == 0) {
+                printf("%s\n", VERSION);
+                exit(0);
+            }
+        } else if (arg[0] == '-') {
+            for (int j = 1; j < n; j++) {
+                if (arg[j] == 'i')
+                    last = 'i';
+                if (arg[j] == 'h') {
+                    print_help_msg();
+                    exit(0);
+                }
+                if (arg[j] == 'V') {
+                    printf("%s\n", VERSION);
+                    exit(0);
+                }
+            }
+        } else {
+            if (last) {
+                if (last == 'i')
+                    args->input = arg;
+                last = 0;
+            }
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    Args args = {0};
+    parse_args(&args, argc, argv);
+
+    if (!args.input) {
+        perror("input playlist path required");
+        exit(1);
+    }
 
     srand(time(NULL));
 
@@ -536,18 +704,18 @@ int main(void) {
     enter_raw_mode();
     write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7);
 
-    PlayList pl = {0};
-    pl_init_with_cap(&pl, 0);
-
-    pl_from_dir(&pl, "/Users/Nikita/Desktop/music.youtube");
-
     PlayerState ps = {0};
+    ps_init(&ps, DEFAULT_SAMPLE_RATE, DEFAULT_FRAMES_PER_BUF, 1, 0.9);
 
-    ps_init(&ps, DEFAULT_SAMPLE_RATE, DEFAULT_FRAMES_PER_BUF, 0.9);
+    PlayList pl = {0};
+    pl_init(&pl, 0);
 
+    pl_from_any_path(&pl, args.input);
+    pl_sort(&pl);
+
+    int n = 0;
     PlayerEvent pe = PE_NONE;
     KeyEvent ke;
-
     for (;;) {
         read_key(&ke);
 
@@ -555,20 +723,17 @@ int main(void) {
             if (ke.ch == 'q')
                 break;
             switch (ke.ch) {
-            case 'n':
+            case 'j':
                 pe = PE_NEXT;
                 break;
-            case 'p':
+            case 'k':
                 pe = PE_PREV;
                 break;
-            case 'r':
+            case 'J':
                 pe = PE_RAND;
                 break;
-            case '.':
+            case 'p':
                 pe = PE_PAUSE;
-                break;
-            case 's':
-                pe = PE_PLAY;
                 break;
             case '+':
                 pe = PE_VOLUP;
@@ -581,14 +746,31 @@ int main(void) {
 
         ps_handle_event(&ps, pe, &pl);
 
+        if (ps.done && ps.is_auto_play) {
+            // wait for last buf
+            usleep(300000);
+            ps_handle_event(&ps, PE_NEXT, &pl);
+        }
+
+        // TODO
+
+        if (n % 10 == 0) {
+            float progress = ps_progress(&ps);
+            int filled = (int)(progress * 30);
+            printf("\r  [");
+            for (int i = 0; i < 30; i++)
+                putchar(i < filled ? '#' : '-');
+            printf("]  %3d%%", (int)(progress * 100));
+            fflush(stdout);
+        }
+
         usleep(20000);
 
         pe = PE_NONE;
+        n++;
     }
 
     exit_raw_mode();
-
-    usleep(500000);
 
     ps_free(&ps);
     pl_free(&pl);

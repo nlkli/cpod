@@ -13,8 +13,26 @@ minimal c audio player
 - [x] frame resampling
 - [x] Core Audio (play)
 - [x] PlayList
-- [ ] CLI args
+- [x] CLI args
 
-## Notes
+## Help message
 
-
+```c
+static const char *HELP_MSG_LINES[] = {
+    "",
+    "minimal c audio player",
+    "https://github.com/nlkli/cpod",
+    "Options:",
+    "  -i, --input <path>   Input playlist path (dir or file)",
+    "  -h, --help           Show this help message",
+    "  -V, --version        Show this help message",
+    "Keymaps:",
+    "  j    Next",
+    "  k    Prev",
+    "  J    Rand",
+    "  p    Pause",
+    "  +    Vol up",
+    "  -    Vol down",
+    "",
+    NULL};
+```

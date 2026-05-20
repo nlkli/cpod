@@ -752,9 +752,7 @@ int main(int argc, char *argv[]) {
             ps_handle_event(&ps, PE_NEXT, &pl);
         }
 
-        // TODO
-
-        if (n % 10 == 0) {
+        if (n % 10 == 0 && !ps.is_pause) {
             float progress = ps_progress(&ps);
             int filled = (int)(progress * 30);
             printf("\r  [");

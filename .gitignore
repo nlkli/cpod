@@ -1,4 +1,5 @@
 .clangd
 cpod
 clang-format
+./bin
 

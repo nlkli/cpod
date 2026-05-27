@@ -2,6 +2,8 @@
 
 set -e
 
+mkdir -p ./bin
+
 clang -Wall \
     -Wextra \
     -I/opt/homebrew/include \
@@ -12,4 +14,4 @@ clang -Wall \
     -lavutil \
     -framework AudioToolbox \
     -framework CoreAudio \
-    main.c -o cpod
+    ./src/main.c -o ./bin/cpod
